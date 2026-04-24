@@ -1,0 +1,42 @@
+# Python bytecode / editable install metadata
+__pycache__/
+*.py[cod]
+*.egg
+*.egg-info/
+
+# Local virtual environment
+.venv/
+venv/
+
+# CUDA build artefacts (host build produces a .so right next to the source,
+# Docker build produces the cpython-3.12 .so in build-docker/).
+build/
+build-docker/
+*.so
+*.o
+*.d
+
+# Benchmark outputs (regenerate locally).
+bench/results/
+!bench/results/.gitkeep
+
+# Editor cruft
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# pytest / coverage caches
+.pytest_cache/
+.cache/
+.coverage
+htmlcov/
+
+# Any accidental secret files the user might drop in
+*.pem
+*.key
+*.env
+.env
+.env.*
+secrets/
+csrc/cutlass/
