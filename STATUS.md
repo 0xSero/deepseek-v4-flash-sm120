@@ -82,6 +82,48 @@ needs a vLLM restart with the env set + a 8k-batched-tokens prompt; not
 yet tested in prod. No code other than `mhc.py` touched (kernel is
 unchanged; we just suppress the n_splits=1 specialization).
 
+## 2026-04-27 afternoon: softmax+output fusion stepping stone — SHIPPED FLAG-OFF, NEUTRAL
+
+`sparse_mla_workspace_output_fused_softmax_kernel<kv_t, out_t>` added to
+`csrc/sm120_sparse_mla_decode.cu`, gated by `DG_SM120_OUTPUT_FUSED_SOFTMAX=1`
+(default OFF). 4-pass kernel that combines the standalone softmax_kernel +
+sstat output_kernel pair into one block-launched kernel: load raw scores,
+blockwide reduce row_max, blockwide reduce row_sum after exp, divide for
+probabilities, then sstat-style PV multiply-accumulate. Order of ops
+preserved vs the standalone pair so results are bit-comparable.
+
+**Math validation** (16 prod-shape configs × 3 seeds = 36 cases, batch
+∈{1,4,8,16}, heads=32, topk∈{64,96,128}):
+- 32/36 cases: bit-exact (max_abs = 0.0)
+- 4/36 cases: max_abs ≤ 6.1e-4 (1 bf16 ULP), mean_abs ≤ 3e-8 — sub-ULP
+  drift from a different reduction order on b=16 cases
+- 0 FAIL
+
+**Microbench** (b=16 heads=32 topk=128, single-GPU avg 200 iters):
+
+| Path | µs/call |
+|------|---:|
+| FUSED=0 (softmax_kernel + sstat_output_kernel) | 24.73 |
+| FUSED=1 (fused softmax+output)                 | 24.48 |
+
+Δ ≈ 1% — within measurement noise. The standalone softmax_kernel was
+only ~3% of prefill GPU time (49ms / 1.74s post-SPLITK profile); output
+kernel ≈14%. Eliminating one launch + one fp32 scores DRAM round-trip
+saves ~0.25 µs/call on a 24 µs decode call. At ~1000 chunks/prefill
+that's ~250 µs total — negligible vs the 1.7s prefill envelope.
+
+**Decision**: ship flag-gated default OFF, document as a NEUTRAL stepping
+stone. The fused path is correct + parity-validated and the smem layout
++ blockwide reductions are the building blocks for the *real* prize: a
+flash-attention-style fused kernel that also subsumes the score MMA.
+That's the next step (scoped below) — this kernel proves the
+softmax+output halves of the algorithm.
+
+Branch: `feat/sm120-flag-gated-mma-kernels`. New file:
+`scripts/parity_fused_softmax.py` + `scripts/parity_fused_softmax_diff.py`.
+Build inside `vllm-deepseekv4-sm120-builder:latest` (host nvcc is 12.9,
+torch is cu130 — must build in the cu130 container).
+
 ## 2026-04-27 evening: flash-attention-style score+softmax+output fusion — DESIGN PARKED, IMPLEMENTATION DEFERRED
 
 Largest remaining single prefill win per the post-SPLITK profile:
