@@ -47,8 +47,36 @@ correctly emitted. `factual_capital` actually *fixed* a bug in baseline
 `feat/sm120-flag-gated-mma-kernels`, commit a7ccdb7.
 
 Future work in benefit order: (a) cp.async double-buffer K to overlap loads
-with MMA, (b) split-N for the OUTPUT kernel mirror (less critical — its
-grid already saturates).
+with MMA, (b) MHC_PRE tile widening so `--max-num-batched-tokens` can grow
+past 4096 (8k still crashes in `vllm.mhc_pre.default` tilelang kernel).
+
+## 2026-04-27: sparse_mla_workspace_output bf16 MMA — SHIPPED FLAG-OFF, NEUTRAL
+
+`sparse_mla_workspace_output_mma_kernel` added to
+`csrc/sm120_sparse_mla_decode.cu` and dispatched from
+`launch_sparse_mla_decode_from_workspace_split` when
+`DG_SM120_OUTPUT_MMA=1` (and fast_path + active_heads ≤ 32 +
+candidate_slots ≤ 128). M=32 N=8 K=128, one block per (batch, head_dim/8)
+= 8×64 = 512 blocks. Same fragment layout as SCORE_MMA_SPLITK; validated
+bit-exact via `DG_SM120_OUTPUT_MMA_SCALAR_CHECK=1` FMA oracle (max_abs
+3e-5 = 1 bf16 ULP, mean_abs 2e-10).
+
+**Perf result (cold-cache, OUTPUT_MMA on top of SPLITK baseline, TP=4)**:
+
+| Tokens | baseline pf/dc | +OUTPUT_MMA pf/dc | Δ prefill | Δ decode |
+|---:|---:|---:|---:|---:|
+|   860 | 2297 / 119.9 | 2336 / 119.8 | +1.7% | -0.1% |
+|  3320 | 3267 / 108.9 | 3225 / 116.0 | -1.3% | +6.5% |
+|  6595 | 3284 / 111.6 | 3234 / 107.0 | -1.5% | -4.1% |
+| 13151 | 3235 / 105.4 | 3221 / 106.3 | -0.4% | +0.9% |
+| 26265 | 3233 / 102.5 | 3206 / 97.2  | -0.8% | -5.2% |
+
+Mixed signs, magnitudes within run-to-run noise — workspace_output is
+**launch-overhead-bound, not flop-bound** (~33M FLOPs total per decode
+step distributed across 512 blocks; MMA fragment-setup ≈ FMA cost at
+this M/K). Decision: ship flag-gated default OFF, document as a
+neutral exploration so we don't redo this. Don't re-bench unless
+active_heads grows past 32 or topk past 128.
 
 ## 2026-04-27 night: sparse_mla_score bf16 MMA kernel — SHIPPED FLAG-OFF, NO WIN
 
