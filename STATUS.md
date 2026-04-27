@@ -50,6 +50,136 @@ Future work in benefit order: (a) cp.async double-buffer K to overlap loads
 with MMA, (b) MHC_PRE tile widening so `--max-num-batched-tokens` can grow
 past 4096 (8k still crashes in `vllm.mhc_pre.default` tilelang kernel).
 
+## 2026-04-27 evening: NCCL env-var sweep — DEAD END (saved to memory)
+
+Captured `NCCL_DEBUG=INFO` topology: NCCL 2.28.9/cuda13.0, 4× Pro 6000 over PCIe
+Gen5 (no NVLink), Trees + Ring built at init, transport SHM/direct.
+
+A/B against SPLITK baseline:
+- `NCCL_ALGO=Tree` alone → CRASHED at init (`ncclAllGather` returned 5 /
+  ncclInvalidUsage; Tree-only forbids the AllGather paths vLLM uses)
+- `NCCL_ALGO=Ring,Tree` + `NCCL_PROTO=LL128` → -5-6% prefill, -3-10% decode
+  regression across ctx 860/3320/6595/13151/26265
+- `NCCL_NTHREADS=512` → neutral (within ±1.5% noise)
+
+Conclusion: AllReduce on this rig is **PCIe-bandwidth-bound**, not
+algo-bound. Ring is already the right choice; protocol/thread-count knobs
+don't unlock more bandwidth. Memory: `feedback_nccl_config_dead_end.md`.
+
+## 2026-04-27 evening: mhc_pre 8k batched-tokens crash — DIAGNOSED + workaround in place
+
+Root cause: `compute_num_split` in `vllm/model_executor/layers/mhc.py` returns
+`n_splits = n_sms // grid_size`. For large batched-token counts the
+`grid_size` rises and `n_splits` can drop to 1; when a process has already
+JIT-compiled the kernel for `n_splits=2`, the recompile to `n_splits=1`
+hits an inductor PTX codegen bug on SM_120. Crash signature is during
+mhc_pre forward at 8k batched tokens.
+
+Workaround: env-flag-gated lower bound on `compute_num_split`.
+`DG_SM120_MHC_NSPLITS_MIN=2` clamps `split_k = max(split_k, 2)`. Default
+is 1 (today's behavior). Single edit in `mhc.py` lines 24-26. Validation
+needs a vLLM restart with the env set + a 8k-batched-tokens prompt; not
+yet tested in prod. No code other than `mhc.py` touched (kernel is
+unchanged; we just suppress the n_splits=1 specialization).
+
+## 2026-04-27 evening: flash-attention-style score+softmax+output fusion — DESIGN PARKED, IMPLEMENTATION DEFERRED
+
+Largest remaining single prefill win per the post-SPLITK profile:
+
+| GPU kernel                                  | ms   | % of GPU  |
+|--------------------------------------------:|-----:|----------:|
+| `sparse_mla_workspace_score (qstat)`        |  425 |    24%    |
+| `sparse_mla_workspace_output (sstat)`       |  256 |    14%    |
+| `sparse_mla_softmax_kernel`                 |   49 |     3%    |
+
+41% of prefill GPU time across three kernels with the same data flow:
+score = QK, softmax, output = PV. They write a fp32 `scores` tensor of
+shape `[num_tokens, active_heads, topk]` to GDDR7 between kernels —
+~54 MiB read+write at ctx=6595/topk=128. Classic flash-attention setup.
+
+### Design
+
+Single fused kernel `sparse_mla_prefill_flash_kernel`. **Grid**: 1 block
+per `token` (collapse all `active_heads=32` into the M-dim, keeps MMA
+fed). **Threads**: 128 (4 warps).
+
+**Per-block smem layout**:
+- `Q[active_heads, kHeadDim]`: 32×512×bf16 = 32 KiB (loaded once at start)
+- `KV_tile[TILE_K, kHeadDim]`: TILE_K×512×bf16, where TILE_K=32
+  → 32 KiB (overwritten per tile; sparse-MLA uses K==V from same `kv`
+  tensor, so single load serves both QK and PV)
+- `O_accum[active_heads, kHeadDim]`: 32×512×fp32 = 64 KiB (running output)
+- `m[active_heads]`, `l[active_heads]`: tiny (256 B total)
+
+Total: ~128 KiB. Pro 6000 SM_120 default block smem cap is ~99 KiB but
+configurable to ~228 KiB via `cudaFuncAttributeMaxDynamicSharedMemorySize`.
+Headroom is fine.
+
+**Per-tile loop** (TILE_K=32 candidates per pass, ⌈topk/32⌉ tiles):
+1. Cooperative gather: load `KV_tile` from `kv[indices[token, k]]` for
+   k in tile; mask k≥limit / invalid index slots to a sentinel that
+   produces -inf score.
+2. QK MMA: `S[heads, TILE_K] = Q @ KV_tile.T` using
+   `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32` over kHeadDim
+   in K-dim (32 chunks of K=16 → 32 fma-accumulated MMAs per tile).
+   Same fragment layout as SCORE_MMA_SPLITK. M=32 → two m16 sub-tiles.
+3. Online-softmax update: per-head `tile_max[h] = max_k S[h,k]`,
+   `new_max = max(m[h], tile_max)`, `rescale = exp(m[h] - new_max)`,
+   `P[h,k] = exp(S[h,k] - new_max)`, `tile_sum = sum_k P[h,k]`.
+4. Output rescale + accumulate: `O_accum[h,d] = rescale*O_accum[h,d] +
+   sum_k P[h,k] * KV_tile[k,d]` (PV MMA with K=TILE_K=32, M=32, N=8 along
+   head_dim — covered by 64 MMAs along the head_dim).
+5. `l[h] = rescale*l[h] + tile_sum`; `m[h] = new_max`.
+
+**Final**: per-head `inv_denom = 1/l[h]`; `gate = sigmoid(lse - sink)`
+when attn_sink is present; `lse = log(l) + m`; write
+`out[token,h,d] = O_accum[h,d] * inv_denom * gate`.
+
+### Expected savings
+
+- Eliminates the `[num_tokens, active_heads, topk]` fp32 scratch
+  (54 MiB of GDDR7 traffic at ctx=6595/topk=128).
+- Eliminates two kernel launches + their device-side syncs.
+- KV is read once per tile (not twice across score+output kernels).
+
+Optimistic upper bound: 41% → ~20-25% of prefill, net ~10-15% e2e at
+long ctx. Realistic target: ~6-10% at long ctx, given that
+`active_heads=32, topk=128` is small enough that the SPLITK score
+kernel already has decent occupancy and L2 reuse.
+
+### Risks
+
+- Per-block smem ~128 KiB requires `cudaFuncSetAttribute(MaxDynamicSmem)`
+  bumped above the default; must verify Pro 6000 SM_120 supports the
+  required size at this kernel's register/occupancy point.
+- Block grid drops from `(topk/16) × active_heads × num_tokens` (split
+  score kernel) to `num_tokens` blocks. At ctx=6595/TP=4 (~1650 tokens/
+  shard), that's ~9 blocks/SM on 188 SMs — borderline. Below ctx=2k
+  could occupancy-starve.
+- Online-softmax with running `O_accum[heads, head_dim]` in smem (64 KiB)
+  needs a coherent thread→element mapping; PV MMA writes back into the
+  same smem tile, so block-sync points need careful placement.
+- bf16 fragment layout for `m16n8k16` is well-trodden in SCORE_MMA_SPLITK;
+  reusing it cuts risk. Add `kScalarCheck` template flag (FMA oracle on
+  same smem) before trusting mma.sync output.
+
+### Why deferred
+
+This is multi-day kernel work (design, MMA layout, smem layout, scalar
+oracle, parity, A/B, quality probe, default-flip decision). The smaller
+mhc_pre clamp + NCCL findings + OUTPUT_MMA neutral result already
+documented during this autonomous block. Not starting flash-fusion
+without user sign-off on scope.
+
+Next concrete step when resumed:
+1. Build a scalar-FMA fused prototype (no MMA) at the same single-block
+   shape — validates online-softmax + KV-tile-reuse memory pattern.
+   Expected to run slower than SPLITK due to FMA throughput, but tells
+   us whether the algorithm is correct end-to-end.
+2. Add `mma.sync` for QK and PV under `kScalarCheck` template flag.
+3. Bench cold-cache nonce-prefix sweep at ctx 860/3320/6595/13151/26265
+   to decide if the kernel ships flag-on or flag-off.
+
 ## 2026-04-27: sparse_mla_workspace_output bf16 MMA — SHIPPED FLAG-OFF, NEUTRAL
 
 `sparse_mla_workspace_output_mma_kernel` added to
