@@ -1,9 +1,56 @@
 # DeepSeek-V4-Flash on SM_120 — Resume Notes
 
-Last updated: 2026-04-27 night session — sparse_mla_score bf16 MMA kernel
-landed behind `DG_SM120_SCORE_MMA=1` (default OFF, no perf win); hc_prenorm
-TF32 MMA kernel landed behind `DG_SM120_HC_PRENORM_MMA=1`; TP=2 ruled out
-as VRAM-infeasible.
+Last updated: 2026-04-27 — split-K bf16 MMA path for sparse_mla_score
+landed behind `DG_SM120_SCORE_MMA_SPLITK=1` (default OFF, **+5-7% prefill at
+long ctx, no semantic regression**); the non-splitk SCORE_MMA stays default
+OFF (regressed). hc_prenorm TF32 MMA kernel landed behind
+`DG_SM120_HC_PRENORM_MMA=1`; TP=2 ruled out as VRAM-infeasible.
+
+## 2026-04-27: sparse_mla_score split-K bf16 MMA — SHIPPED FLAG-OFF, REAL WIN
+
+`sparse_mla_workspace_score_mma_splitk_kernel` + reduce kernel added to
+`csrc/sm120_sparse_mla_decode.cu`. Splits head_dim=512 four ways across
+blocks (128 elems per block), emits float32 partials, then a small reduce
+kernel sums the splitk dim and applies softmax_scale + validity mask. Grid is
+`(ceil(slots/8), batch, splitk=4)` → 512 blocks at B=8/topk=128 (vs 188 SMs,
+~3 waves) where the original SCORE_MMA produced too few blocks (~128) to hide
+launch + MMA setup. M=32 (all `active_heads` together in one block).
+Triggers with `DG_SM120_FAST_SPARSE_MLA=1 DG_SM120_SCORE_MMA_SPLITK=1`.
+
+Math validated: bit-exact OUT/LSE vs FAST_SPARSE_MLA reference across full
+production shape (batch=8, heads=32, head_dim=512, topk=128); MMA fragment
+layout verified via `kScalarCheck` template flag (FMA oracle reading the
+SAME smem) — bit-exact with the `mma.sync` path. Activation proven via
+intentional 1.0001f bug test (output diverged → bug reverted → bit-exact
+again).
+
+**Perf result (cold-cache, nonce-prefix bench, TP=4 on 4× Pro 6000)**:
+
+| Tokens | FAST_SPARSE_MLA | + SCORE_MMA_SPLITK | Δ prefill |
+|---:|---:|---:|---:|
+|   860 | 3058 | 2860 | -6% |
+|  3320 | 3427 | 3479 | +1.5% |
+|  6595 | 3274 | 3377 | +3.1% |
+| 13151 | 3135 | 3309 | +5.5% |
+| 26265 | 3057 | 3255 | +6.5% |
+
+Quality probe vs FAST_SPARSE_MLA baseline: 0/5 semantic regressions. Soft
+token-level diffs only (CoT wording: "Let's think step by step" vs "Let's go
+step by step" — same arithmetic). Needle code (`BLUEHORIZON-7142`)
+correctly emitted. `factual_capital` actually *fixed* a bug in baseline
+(Italy: Venice→Rome).
+
+**Decision**: ship flag-gated, default OFF until production rig confirmation.
+`DG_SM120_SCORE_MMA_SPLITK=1` is the recommended opt-in. Pairs with
+`DG_SM120_FAST_SPARSE_MLA=1`. Activation gated on
+`fast_path && active_heads <= 32`. Branch:
+`feat/sm120-flag-gated-mma-kernels`, commit a7ccdb7.
+
+Future work in benefit order: (a) cp.async double-buffer K to overlap loads
+with MMA, (b) split-N for the OUTPUT kernel mirror (less critical — its
+grid already saturates).
+
+## 2026-04-27 night: sparse_mla_score bf16 MMA kernel — SHIPPED FLAG-OFF, NO WIN
 
 ## 2026-04-27 night: sparse_mla_score bf16 MMA kernel — SHIPPED FLAG-OFF, NO WIN
 
