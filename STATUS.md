@@ -1,10 +1,291 @@
 # DeepSeek-V4-Flash on SM_120 — Resume Notes
 
-Last updated: 2026-04-27 — split-K bf16 MMA path for sparse_mla_score
-landed behind `DG_SM120_SCORE_MMA_SPLITK=1` (default OFF, **+5-7% prefill at
-long ctx, no semantic regression**); the non-splitk SCORE_MMA stays default
-OFF (regressed). hc_prenorm TF32 MMA kernel landed behind
-`DG_SM120_HC_PRENORM_MMA=1`; TP=2 ruled out as VRAM-infeasible.
+Last updated: 2026-04-28 — **`DG_SM120_SCORE_QSTAT_VEC` shipped default
+ON.** bf16x4 (uint64) vec-load variant of `score_tiled_qstat` (the
+prefill #1 hot kernel — 26.9% of GPU time per profile). 4× LDG-count
+reduction. Microbench at the prod chunk-prefill shape (b=16/h=32/topk=128):
+24.73 → 20.75 µs (+16%). Multi-trial e2e A/B at TP=4: prefill flat
+(+0.5-0.9% — within noise; prod prefill is PCIe-AllReduce-bound), decode
+@8k +6.6%, 32k decode +1.6%. Math sub-bf16-ULP (28/36 bit-exact, 8/36 OK
+≤1.5e-5); 10-prompt quality probe at temp=0 passes. The two heavier
+fusion paths (score+softmax fusion, score+softmax+output triplet) were
+**analytically eliminated** without re-implementation — both are
+structurally identical to known-loss patterns on this rig
+(OUTPUT_FUSED_SOFTMAX neutral, FLASH_FUSION_MMA_SPLITK 1.7× slower than
+chain even with split-K parallelism recovery); see notes.
+
+Earlier this week: prefill flash-fusion REG_O + cp.async double-buffer
+landed flag-gated default OFF (4.3-5.8× over PV-MMA single-buffer,
+8-9× over the original 3-kernel chain at microbench, but does NOT fire
+in the vLLM chunked-prefill prod path — see architecture mismatch note).
+Split-K bf16 MMA path for sparse_mla_score landed behind
+`DG_SM120_SCORE_MMA_SPLITK=1` (default OFF). hc_prenorm TF32 MMA kernel
+shipped behind `DG_SM120_HC_PRENORM_MMA=1` (default ON post-2xTF32 PR).
+
+## 2026-04-28: SCORE_QSTAT_VEC ships, fusion paths analytically skipped
+
+### What landed
+`sparse_mla_workspace_score_tiled_qstat_vec_kernel` — same block grid as
+the scalar `score_tiled_qstat` (`(ceil(slots/32), active_heads, batch)`),
+same Q-stationary smem layout, same 32-element accumulation breadth per
+(b,h,j). The inner per-thread loop was rewritten to issue 16 LDG.E.U64
+over head_dim=512 instead of 64 LDG.E.U16:
+
+- Scalar (baseline): 64 single-bf16 loads stride-8, running sum.
+- VEC: reinterpret_cast each 4-elt K row chunk as `__nv_bfloat162 [2]`,
+  unpack to fp32 quad, accumulate `q*kv` 4-wide, advance stride-32 across
+  head_dim.
+
+A `kScalarCheck=true` template flag re-runs the original scalar reduction
+order from inside the same kernel, used as an FMA oracle for math parity
+debug.
+
+### Dispatcher gates
+Kernel only fires when **all** of:
+
+1. `DG_SM120_FAST_SPARSE_MLA=1` (qstat path active)
+2. `DG_SM120_SCORE_QSTAT_VEC=1` (this flag)
+3. `q_t == bf16 && kv_t == bf16`
+4. `kv_workspace.stride(2) == 1` (innermost head_dim contiguous, required
+   for the bf16x4 reinterpret_cast)
+5. `kHeadDim % 32 == 0`
+6. NOT `used_mma_score` (mutually exclusive with SCORE_MMA path)
+
+If any gate fails, falls through to the scalar qstat kernel — no behavior
+change vs prior baseline.
+
+### Math
+- 36/36 cases pass parity vs scalar oracle on `parity_fused_softmax.py`
+  harness (b∈{1,4,8,16}, topk∈{64,96,128}, 3 seeds each). 28 bit-exact;
+  8 OK with `max_abs ≤ 1.5e-5`, `mean_abs ≤ 6e-11`. Reduction order
+  differs from scalar (4-elt quad sum vs running stride-8 sum); float
+  non-associativity bounds drift to sub-bf16-ULP.
+
+### Perf
+Microbench at the prod chunk-prefill shape (b=16, h=32, topk=128, 300
+iters):
+
+| Variant       | µs/call | Δ vs scalar |
+|---------------|--------:|------------:|
+| SCALAR (qstat)|   24.73 |       —     |
+| QSTAT_VEC     |   20.75 |    **+16%** |
+
+Multi-trial e2e A/B (4× Pro 6000, TP=4, FAST_SPARSE_MLA=1,
+HC_PRENORM_MMA=1, 2xTF32=1, warmup eliminated, median tok/s):
+
+| Config | 8k pf | 32k pf | 8k dec | 32k dec |
+|--------|------:|-------:|-------:|--------:|
+| VEC=0  |  3459 |   3161 |   99.4 |    92.0 |
+| VEC=1  |  3490 |   3176 |  106.0 |    93.5 |
+| Δ%     | +0.9% |  +0.5% | **+6.6%** |  +1.6% |
+
+Prefill is essentially flat — the +16% kernel speedup is real but does
+NOT translate to e2e prefill TTFT because the prod prefill path is
+PCIe-AllReduce-bound at 4× Pro 6000 (no NVLink), per
+`project_pcie_low_util_dsv4.md`. Decode is more sensitive because score
+fires once per token on the critical path with less surrounding work to
+hide it. **Net: +6.6% decode @8k for free.** A first-trial-only A/B
+showed +21%/+13% at 8k/32k prefill but disappeared on warmup-matched
+re-bench (cold KV cache + first-call CUDA-graph capture inflates VEC=0
+TTFT). All numbers in the table above use a 5-trial median post-warmup.
+
+### Why the bigger fusions were skipped without re-implementation
+
+**Score+softmax fusion (`DG_SM120_SCORE_FUSED_SOFTMAX` proposed):**
+Would collapse score parallelism from 4 blocks per (b,h) → 1 block per
+(b,h) so the row-max + row-sum reductions can fit in one CTA. This is
+the same parallelism collapse documented in `OUTPUT_FUSED_SOFTMAX`
+(NEUTRAL ~1%) and the `FLASH_FUSION` decode variants (1.7-3.6× SLOWER
+than chain). The score half has higher arithmetic intensity than the
+output half, so collapsing its parallelism is more harmful than
+collapsing softmax+output parallelism (which was already neutral). No
+design tweak rescues without going back to the chain.
+
+**Score+softmax+output triplet fusion w/ topk-split-K
+(`DG_SM120_SCORE_OUTPUT_FUSED` proposed):** This is structurally
+identical to `sparse_mla_workspace_flash_mma_splitk_kernel` already
+shipped flag-OFF — that kernel is "+38% over non-split MMA at
+topk=128/b=16, but still 1.7× slower than chain". Split-K already
+recovered parallelism and the fused kernel STILL lost. The binding
+constraint is shared-memory working set (Q + K + V scratch + scores +
+softmax reduce) compressing occupancy below 1 block/SM, NOT parallelism.
+SM_120's 99 KB per-CTA dynamic smem cap doesn't leave room. The B200
+(SM_100) wgmma + tcgen05 async tile pipelines could rescue this but are
+explicitly off-limits on this rig — Pro 6000 is closer to super-Ada than
+to B200 despite "Blackwell" branding.
+
+### What's actually movable next
+- **More vec-load conversions** on remaining hot kernels —
+  `sparse_mla_workspace_output` was 14% of decode GPU time, structurally
+  similar to score (per-thread strided bf16 sums); same bf16x4 LDG trick
+  should apply.
+- **Comm-side optimizations** — PCIe AllReduce dominates prefill latency
+  at 4× Pro 6000 (NCCL knob tuning is already exhausted per
+  `feedback_nccl_config_dead_end.md`). Future work: payload batching at
+  scheduler level so fewer-larger AllReduces hit the wire.
+- **Flash-fusion prefill kernel for chunked-prefill** — landed
+  flag-gated, validated +4-9× microbench, but doesn't fire in vLLM's
+  chunked-prefill prod path (decode-style kernels per 16-token chunk).
+  Wiring it in would require scheduler-level changes.
+
+## 2026-04-27 night: REG_O + CPASYNC unblocked — 4-9× over baseline
+
+`sparse_mla_prefill_workspace_flash_mma_kernel` gained a `kRegO=true`
+template path that holds the 16×512 fp32 O_accum in per-lane MMA D-frag
+registers (4 fp32 × 16 N-issues = 64 fp32/lane = 256 B/thread) instead of
+32 KB of shared memory. Phase 1 init becomes a register zero, Phase 2h
+rescale becomes a per-lane register multiply against `rescale[groupID]`
++ `rescale[groupID+8]`, Phase 2i PV-MMA accumulates directly into d_o
+without smem load/store, Phase 3 writeout streams d_o[n_iss][0..3] *
+(gate/l) directly to global memory via the fragment lane mapping.
+
+Freeing the 32 KB drops single-buffer smem from ~84 KB to ~52 KB and
+double-buffer smem from ~118 KB to ~85 KB — finally fitting under
+SM_120's 99 KB `cudaDevAttrMaxSharedMemoryPerBlockOptin` cap. The cp.async
+fallback warning that previously fired on `CPASYNC=1` is now silent when
+combined with `REG_O=1`.
+
+PTXAS: `Used 155 registers, 0 bytes spill stores, 0 bytes spill loads`
+on the kRegO=true variants — fits comfortably in SM_120's 255-reg cap.
+
+**Math** (REG_O=1 vs REG_O=0, REG_O=1+CPASYNC=1 vs REG_O=1, 9-case sweep):
+**out_diff = 0.0, lse_diff = 0.0** — bit-identical across all combos and
+all tested shapes (tokens ∈ {64, 256, 1024} × topk ∈ {256, 1024, 2048}).
+
+**Perf microbench (heads=32, kv=4096, 30 iters, bf16, single GPU)**:
+
+| Tokens | TopK | PV-MMA (µs) | + REG_O (µs) | + CPASYNC (µs) | REG_O | + CP |
+|---:|---:|---:|---:|---:|---:|---:|
+|  256 |  256 |   1,955 |   1,895 |     412 | 1.03× | **4.75×** |
+|  256 | 1024 |   7,407 |   6,689 |   1,291 | 1.11× | **5.74×** |
+|  256 | 2048 |  15,047 |  13,472 |   2,581 | 1.12× | **5.83×** |
+| 1024 |  256 |   6,497 |   5,678 |   1,297 | 1.14× | **5.01×** |
+| 1024 | 1024 |  25,098 |  22,056 |   4,573 | 1.14× | **5.49×** |
+| 1024 | 2048 |  49,779 |  43,680 |   8,943 | 1.14× | **5.57×** |
+| 4096 |  256 |  25,133 |  22,277 |   5,879 | 1.13× | **4.27×** |
+| 4096 | 1024 |  97,941 |  86,154 |  20,104 | 1.14× | **4.87×** |
+| 4096 | 2048 | 193,644 | 170,082 |  38,928 | 1.14× | **4.97×** |
+
+REG_O alone gives ~1.10-1.14× by dropping the smem round-trip and zero/init
+loops. CPASYNC on top of REG_O delivers the headline 4-6× win — likely a
+combination of (a) hiding K-tile global loads behind QK+softmax+PV compute,
+(b) cp.async's 16-byte chunked .cg loads (4× fewer loop iters than the sync
+gather's per-thread bf16 hops), and (c) staying bf16 through the smem path
+without the synchronous gather's bf16↔float round-trip. The synchronous K
+gather was a much larger fraction of total kernel time than the inner-loop
+microbench numbers had suggested.
+
+vs the original 3-kernel chain (e.g. t=4096, topk=2048: chain 349 ms →
+PV-MMA 193 ms → REG_O+CP 38.9 ms) this is **~9× over the chain** — the
+biggest single perf jump on the sparse-MLA path so far this iteration.
+
+**Decision**: keep flag-OFF until E2E rig validation. Activation when
+ready: `DG_SM120_FAST_SPARSE_MLA=1 DG_SM120_FLASH_FUSION_PREFILL=1
+DG_SM120_FLASH_FUSION_PREFILL_REG_O=1 DG_SM120_FLASH_FUSION_PREFILL_CPASYNC=1`.
+The launcher refuses `REG_O=1` with `PV_SCALAR=1` (warns + falls back) since
+the scalar-PV path still uses smem O.
+
+## 2026-04-27 night: prefill FLASH_FUSION_PREFILL PV-MMA — SHIPPED FLAG-OFF, 1.30× OVER PV-SCALAR
+
+`sparse_mla_prefill_workspace_flash_mma_kernel` PV path upgraded from scalar
+fp32 FMA to `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`. Each warp
+owns kHeadDim/4 = 128 d-cols; per K-tile runs 16 N-issues × 2 K-iters of
+m16n8k16 MMA. K_tile B-fragment loaded via
+`ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16` from row-major smem. Scores
+A-fragment is built per-lane by casting fp32 P[h,k] to bf16 in registers
+(no extra smem). The PV-MMA path replaces 16384 scalar FMAs/tile/CTA with
+32 MMA issues.
+
+**Alignment**: `ldmatrix` requires 16-byte aligned row addresses. Bumped
+`kFlashKPad` from 2 → 8 so K_tile row stride becomes 520 bf16 = 1040 B
+(16-aligned) while still breaking the 32-bank conflict (520 % 32 ≠ 0).
+
+**Math** (vs chain, 18-case sweep): max out_diff **1.22e-4**, max lse_diff
+**9.5e-7** — bit-identical to PV-scalar baseline. PV-MMA fragment validated
+via `kScalarCheck` template flag (oracle reads same smem) — diff = 0.
+
+**Perf microbench (heads=32, kv=4096, 30 iters, bf16, single GPU)**:
+
+| Tokens | TopK | Chain (µs) | PV-Scalar (µs) | PV-MMA (µs) | MMA vs Chain | MMA vs Scalar |
+|---:|---:|---:|---:|---:|---:|---:|
+|  256 |  256 |   2,829 |   2,564 |   1,958 | **1.45×** | 1.31× |
+| 1024 | 1024 |  44,473 |  32,527 |  25,079 | **1.77×** | 1.30× |
+| 1024 | 2048 |  87,825 |  64,411 |  49,797 | **1.76×** | 1.29× |
+| 4096 |  256 |  45,170 |  32,310 |  25,116 | **1.80×** | 1.29× |
+| 4096 | 1024 | 177,114 | 126,587 |  97,918 | **1.81×** | 1.29× |
+| 4096 | 2048 | 349,170 | 250,502 | 193,444 | **1.81×** | 1.29× |
+
+PV-MMA tracks ~1.30× over PV-scalar uniformly — confirms PV is the dominant
+inner-loop cost at TILE_K=32 (16 K-cells × 512 d-cols = 8192 FMAs/iter/CTA).
+
+**Decision**: ship flag-OFF behind `DG_SM120_FLASH_FUSION_PREFILL=1` (PV-MMA
+is the default path; opt-out via `DG_SM120_FLASH_FUSION_PREFILL_PV_SCALAR=1`
+keeps the PV-scalar fallback for triage). E2E rig validation still pending
+before flipping default.
+
+## 2026-04-27 night: cp.async double-buffer K_tile — SCAFFOLDED, BLOCKED BY SM_120 SMEM CAP
+
+Pipelined K-gather scaffold landed behind
+`DG_SM120_FLASH_FUSION_PREFILL_CPASYNC=1` (default OFF). New template param
+`kPipeline`, `cp.async.cg.shared.global` issue lambda, prologue + intra-loop
+prefetch, `cp.async.wait_group(1)`. **Doesn't fit on SM_120**: doubling
+K_tile (33KB→66KB) pushes smem from 84KB to 118KB; RTX Pro 6000 reports
+`shared_memory_per_block_optin: 101376` so the launch fails.
+
+The launcher detects this at runtime and silently falls back to
+single-buffer with one-time stderr warning:
+```
+[sm120-flash-fusion-prefill] CPASYNC requested but pipelined smem
+(118080 B) exceeds device cap (101376 B); falling back to single-buffer.
+```
+Math still bit-identical to PV-MMA single-buffer at all 4 tested shapes.
+
+**To unblock**: refactor `O_accum_smem` (32 KB) into per-thread D-frag
+registers (4 fp32 × 16 N-issues = 64 fp32/lane = 256 B/thread; reg
+pressure ~30 → ~95, fits in SM_120's 255-reg cap). After that, post-
+pipeline smem ≈ 84 KB → fits with headroom. 2-3 hour kernel refactor;
+not chased tonight. Memory: `project_flash_fusion_prefill_cpasync_blocked.md`.
+
+## 2026-04-27 evening: prefill FLASH_FUSION_PREFILL — SHIPPED FLAG-OFF, FIRST WIN
+
+`sparse_mla_prefill_workspace_flash_mma_kernel` (in
+`csrc/sm120_sparse_mla_decode.cu`) replaces the score+softmax+output 3-kernel
+chain on the workspace prefill path with one fused kernel. Online flash-
+attention with bf16 `mma.sync.aligned.m16n8k16` QK + scalar-fp32 PV +
+running m/l/O accumulators. K is gathered via `kv[indices[token, k_idx], d]`
+in a TILE_K=32 outer loop. Grid `(num_tokens, ceil(active_heads/16))` —
+~8192 blocks at num_tokens=4096, ~70%+ SM util, no split-K needed.
+Activation: `DG_SM120_FAST_SPARSE_MLA=1 DG_SM120_FLASH_FUSION_PREFILL=1`.
+
+**Math** (vs chain, kv 4096, heads 32, 18-case sweep):
+- max out_diff = **1.22e-4** (sub-bf16-ULP at output magnitude ~3e-2)
+- max lse_diff = **9.5e-7**
+- 18/18 PASS at threshold (out ≤ 5e-3, lse ≤ 5e-2)
+
+**Perf microbench (heads=32, kv=4096, 30 iters, bf16, single GPU)**:
+
+| Tokens | TopK | Chain (ms) | Flash (ms) | Speedup |
+|---:|---:|---:|---:|---:|
+|  256 |  256 |   2.83 |   2.57 | 1.10× |
+|  256 | 1024 |  10.67 |   9.54 | 1.12× |
+|  256 | 2048 |  21.88 |  19.18 | 1.14× |
+| 1024 | 1024 |  44.37 |  32.77 | 1.35× |
+| 1024 | 2048 |  87.83 |  65.03 | 1.35× |
+| 4096 |  256 |  45.20 |  32.56 | 1.39× |
+| 4096 | 1024 | 177.11 | 127.67 | 1.39× |
+| 4096 | 2048 | 349.17 | 253.22 | 1.38× |
+
+Speedup tracks the predicted ~50% K-read bandwidth saving (chain reads kv twice
+— score + output — fusion reads once) plus the eliminated softmax kernel and
+~8000× fewer Q-reload events per token. Win plateaus at ~1.4× as token count
+grows — bandwidth dominates over launch overhead at large shapes.
+
+**Decision**: ship flag-OFF behind `DG_SM120_FLASH_FUSION_PREFILL=1`. Needs
+e2e validation on the rig (cold-cache nonce-prefix bench + quality probe)
+before flipping default. Scalar-FMA oracle available via
+`DG_SM120_FLASH_FUSION_PREFILL_SCALAR_CHECK=1`.
+
+
 
 ## 2026-04-27: sparse_mla_score split-K bf16 MMA — SHIPPED FLAG-OFF, REAL WIN
 
@@ -123,6 +404,140 @@ Branch: `feat/sm120-flag-gated-mma-kernels`. New file:
 `scripts/parity_fused_softmax.py` + `scripts/parity_fused_softmax_diff.py`.
 Build inside `vllm-deepseekv4-sm120-builder:latest` (host nvcc is 12.9,
 torch is cu130 — must build in the cu130 container).
+
+## 2026-04-27 evening: flash-fusion MMA + SPLIT-K — SHIPPED FLAG-OFF, +38% over non-split but still 1.7× slower than chain
+
+`sparse_mla_workspace_flash_mma_splitk_partial_kernel` +
+`sparse_mla_workspace_flash_mma_splitk_reduce_kernel` added. Splits
+candidate_slots across `kFlashMmaSplitK=4` partial blocks per (b, h_block)
+to improve grid occupancy: each partial accumulates (m, l, O) over its
+slot slice, reduce kernel merges via online-softmax combine. Grid lifts
+from 32 (b=16, h_block=2) to 128 partial + 32 reduce blocks.
+
+**Math**: 36/36 cases pass parity vs chain at max_abs ≤ 1.22e-4 (identical
+to non-split MMA — online-softmax merge introduces zero additional drift).
+
+**Perf microbench (b=16 h=32)**:
+
+| topk | chain | mma | mma+splitk | splitk vs chain | splitk vs mma |
+|---:|---:|---:|---:|---:|---:|
+|  64 |  63 µs | 154 µs | **130 µs** | 2.1× slower | +16% |
+| 128 |  91 µs | 256 µs | **158 µs** | 1.7× slower | **+38%** |
+
+Split-K closed roughly half the gap at topk=128. Confirms occupancy was
+a real bottleneck — but PV scalar fp32 + 1-block/SM smem (84 KB) still
+binds. Possible follow-ups: PV-MMA via `ldmatrix.sync.aligned.m8n8.x4.trans`
+to move the 8192-cell × 32-K scalar PV onto MMA throughput; SPLIT_K=2
+dynamic for topk≤64 (current SPLIT_K=4 wastes K-tile lanes when split_step<32).
+
+Activation: `DG_SM120_FAST_SPARSE_MLA=1 DG_SM120_FLASH_FUSION_MMA_SPLITK=1`.
+
+## 2026-04-27 evening: flash-fusion MMA — SHIPPED FLAG-OFF, 32% FASTER THAN FMA BUT STILL OCCUPANCY-BOUND
+
+`sparse_mla_workspace_flash_mma_kernel<q_t, kv_t, out_t, kScalarCheck>` added
+to `csrc/sm120_sparse_mla_decode.cu`. K-tiled flash-attention (TILE_K=32) with
+bf16 `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32` for QK and scalar
+fp32 FMA for PV. Online flash-attention softmax (per-tile max + rescale + exp +
+sum, accumulating O = O*rescale + P @ K_tile per tile). Gated by
+`DG_SM120_FLASH_FUSION_MMA=1` (default OFF), fires when `fast_path` and
+`candidate_slots ≤ kFlashMmaTopkMax=128`. Block tile M=16 heads × N=32 slots,
+4 warps × 32 threads = 128 thr/block. Smem ~84 KB/block (Q 16 KB + K_tile 32 KB
+padded + O_accum 32 KB + scores 2 KB + m/l/tm/resc/tsum 320 B).
+
+**Math**: 36/36 cases pass, max_abs ≤ **1.22e-4** vs chain across full sweep
+(b∈{1,4,8,16} × topk∈{64,96,128} × 3 seeds). Sub-bf16-ULP at this output
+magnitude (~3e-2). MMA fragment layout proven via `kScalarCheck` template
+oracle reading the same smem — scalar-vs-mma diff = 0–1.5e-5 max.
+
+**Perf microbench (b=16 h=32, no validity masking)**:
+
+| topk | chain | flash-fusion FMA | flash-fusion MMA | MMA vs chain | MMA vs FMA |
+|---:|---:|---:|---:|---:|---:|
+|  64 |  63 µs | 226 µs | 154 µs | **2.4× slower** | 32% faster |
+| 128 |  91 µs |   —    | 256 µs | **2.8× slower** | (—)        |
+
+MMA path beats FMA by ~32% (QK throughput improvement) but is still occupancy-
+bound: 84 KB smem/CTA → 1 block/SM, only 32 blocks at b=16 × h_block=2 → 17%
+SM utilization. The chain launches hundreds of (cs_block × heads × batch)
+score blocks + (heads × batch) output blocks → ~5 waves saturated.
+
+**Why the design ships flag-OFF anyway**: math is end-to-end validated and the
+perf result quantifies exactly *what* needs to change. Two follow-up levers:
+(a) split-K across slots so multiple blocks contribute partial m, l, O per
+(b, h_block) with a final online-softmax merge — bringing grid to ~128 blocks
+at b=16 (~70% SM util); (b) PV-MMA via `ldmatrix.sync.aligned.m8n8.x4.trans`
+to load K_tile with K=slots / N=dims fragment ordering. Split-K is the higher-
+leverage move and is now task #66.
+
+Activation: `DG_SM120_FAST_SPARSE_MLA=1 DG_SM120_FLASH_FUSION_MMA=1`.
+Validation: `DG_SM120_FLASH_FUSION_MMA_SCALAR_CHECK=1` swaps QK MMA for the
+scalar-FMA oracle reading the same smem.
+
+## 2026-04-27 evening: flash-fusion scalar-FMA prototype — SHIPPED FLAG-OFF, PERF REGRESSION (math validated)
+
+`sparse_mla_workspace_flash_kernel<q_t, kv_t, out_t>` added to
+`csrc/sm120_sparse_mla_decode.cu` (vLLM-experiment repo). Single-block
+score+softmax+output fusion via scalar bf16 FMA. Gated by
+`DG_SM120_FLASH_FUSION=1` (default OFF), only fires when `fast_path` and
+`candidate_slots <= kFlashTopkMax = 64`. Build path:
+`vllm-deepseekv4-sm120-builder:latest` cu130 container.
+
+**Smem layout**: `Q[heads,512]` + `K[topk,512]` (bf16) +
+`scores[heads,topk]` (fp32) + `reduce_buf[256]` (fp32). Total ~67 KiB at
+topk=64; bumped via `cudaFuncSetAttribute(MaxDynamicSmem)`.
+
+**Phases**: (0) load Q, (1) load K with validity-zeroed rows, (2)
+QK FMA dot-product with 2-thread/slot warp reduction, (3) blockwide
+row_max, (4) exp + row_sum, (5) divide, (6) PV scalar FMA per-thread d
+× sequential k.
+
+**Math validation** (12 cases, b∈{1,4,8,16} × topk=64 × seeds, vs the
+chain): 7/12 BIT-EXACT, 5/12 sub-bf16-ULP drift (max_abs ≤ 3e-5), 0 FAIL.
+
+**Microbench** (b=16 heads=32 topk=64, single-GPU avg 200 iters):
+
+| Path | µs/call |
+|------|---:|
+| FLASH=0 (score + softmax + output chain) | 62.68 |
+| FLASH=1 (single-block fused FMA)         | 258.69 |
+
+**4× SLOWDOWN initially; 3.6× after bank-conflict pad fix (kFlashKPad=2).**
+Two perf killers:
+1. ~~**K_smem bank conflicts**: `K[k*512+d]` row stride = 1024 bytes →~~
+   ~~the warp's 32-lane bf16 read for fixed `k` hits 16-way bank conflict~~
+   ~~(32 banks × 4 bytes; bf16 row stride collides every 16 lanes).~~
+   FIXED via 2-bf16 row pad (stride 1028 B, gcd(257,32)=1). 258.69 → 226.36 µs
+   (-12%) at b=16/topk=64. Bank conflict was real but secondary.
+2. **Low occupancy** (DOMINANT): 67 KiB smem/CTA → 1 block/SM on 188 SMs
+   vs the chain's `(slots/16) × heads × batch` = 16384 blocks at b=16.
+   Not fixable without MMA (collapses K=512 scalar FMAs into ~32 MMA
+   instructions) or head-dim splitting (cuts smem in half but needs an
+   extra reduce pass).
+
+**Smem cap** (~99 KiB per-CTA dynamic on SM_120) forces `kFlashTopkMax=64`,
+so production topk=128 currently falls back to the chain. A K-tiled
+variant (TILE_K=32, ⌈topk/32⌉ tiles, online-softmax across tiles) would
+fit topk=128 in ~36 KiB but adds a per-tile KV reload — the design
+assumed K-stationary.
+
+**Decision**: ship flag-gated default OFF, document as a NEUTRAL→NEGATIVE
+stepping stone like OUTPUT_FUSED_SOFTMAX. The algorithm is correct
+end-to-end; what FMA + bank-conflicted layout can't unlock is the MMA
++ swizzled K layout that actually wins. Path forward in priority order:
+
+1. **Bank-conflict-free K layout**: transposed/swizzled or padded
+   `K[k*528+d]` (528 = 512 + 16-byte pad) — drops 16-way to no-conflict.
+2. **MMA upgrade** (scoped task #59): `mma.sync.aligned.m16n8k16` for
+   QK and PV; same fragment layout already validated in SCORE_MMA_SPLITK.
+3. **K-tiling for topk=128** (scoped task #63): online-softmax across
+   tiles, online output-rescale.
+
+Branch: `feat/sm120-flag-gated-mma-kernels`. New files:
+`scripts/parity_flash_fusion.py` + `scripts/repro_flash_hang.py` (hang
+diagnostic from a warp-divergent shfl bug fixed during bring-up:
+`__shfl_xor_sync` was inside an `if (valid)` guard, deadlocked on
+warps with mixed slot validity — fix moved the shfl unconditional with
+zero-padded invalid K rows).
 
 ## 2026-04-27 evening: flash-attention-style score+softmax+output fusion — DESIGN PARKED, IMPLEMENTATION DEFERRED
 
