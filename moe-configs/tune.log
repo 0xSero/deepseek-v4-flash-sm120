@@ -1,0 +1,18 @@
+<frozen importlib._bootstrap_external>:1297: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+<frozen importlib._bootstrap_external>:1297: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+[2026-04-26 13:26:35] WARNING hf_transformers_utils.py:193: SGLANG_APPLY_CONFIG_BACKUP=auto: checkpoint has num_hidden_layers=43, dispatching to 'small'.
+[2026-04-26 13:26:35] WARNING hf_transformers_utils.py:212: SGLANG_APPLY_CONFIG_BACKUP=small: using packaged /workspace/sglang/python/sglang/srt/configs/config_backup_small.json instead of the checkpoint's config.json at /workspace/model.
+Namespace(model='/workspace/model', tp_size=4, ep_size=1, dtype='fp8_w8a8', per_channel_quant=False, seed=0, batch_size=None, tune=True, disable_shared_experts_fusion=False)
+Traceback (most recent call last):
+  File "/workspace/sglang/benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py", line 458, in <module>
+    main(args)
+  File "/workspace/sglang/benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py", line 317, in main
+    model_config = get_model_config(
+                   ^^^^^^^^^^^^^^^^^
+  File "/workspace/sglang/benchmark/kernels/fused_moe_triton/common_utils.py", line 125, in get_model_config
+    E = config.num_local_experts // ep_size
+        ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/transformers/configuration_utils.py", line 207, in __getattribute__
+    return super().__getattribute__(key)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'DeepseekV3Config' object has no attribute 'num_local_experts'

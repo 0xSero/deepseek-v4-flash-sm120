@@ -40,3 +40,4 @@ htmlcov/
 .env.*
 secrets/
 csrc/cutlass/
+.claude/
